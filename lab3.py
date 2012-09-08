@@ -31,7 +31,7 @@ def process_received_messages(mp):
           voted = True
       elif msg.kind == "MCAST_CS_RELEASE":
         # On receipt of a release
-        if !requests_queue.empty():
+        if not requests_queue.empty():
           # remove head of queue and send reply
           head = requests_queue.get()
           cs_ack = TimeStampedMessage(self.local_name, head.src, "CS_ACK", self.local_name)
@@ -46,6 +46,7 @@ def process_received_messages(mp):
           lock_acquired_event.set()
       else:
         # Ignore
+        pass
       msg = mp.receive()
     time.sleep(0.5) # Sleep for half-a-second
 

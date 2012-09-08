@@ -48,14 +48,16 @@ class MessagePasser(object):
       self.groups[config['Name']] = config['Group']
 
     self.mcast_group = self.groups[self.local_name]
+    self.mcast_group.sort()
 
     # Set a unique node id based on alphabetical ordering
     nodes_keys = self.nodes.keys()
-    self.nid = nodes_keys.sort().index(self.local_name)
+    nodes_keys.sort()
+    self.nid = nodes_keys.index(self.local_name)
 
     # GroupID of the current process
     # All processes in the same group have different group IDs
-    self.gid = self.mcast_group.sort().index(self.local_name)
+    self.gid = self.mcast_group.index(self.local_name)
 
     # Read in new SendRules
     for sr in dataMap['SendRules']:
@@ -188,9 +190,11 @@ class MessagePasser(object):
       sc.close()
       logging.debug('Socket closed')
 
+      logging.debug("Message received - Src: %s - Kind: %s - ID: %s" % (msg.src, msg.kind, msg.id))
       action = self.__match_message(msg)
       if action is not None:
         if action == "drop":
+          logging.debug("Packet from %s dropped" % (msg.src,))
           continue # Packet dropped
         elif action == "duplicate":
           self.recQueue.put(msg)
@@ -211,56 +215,59 @@ class MessagePasser(object):
       msg = self.recQueue.get()
 
       # Process only MCAST/MCAST_NACK messages
-      if !msg.kind.startswith("MCAST"):
+      if not msg.kind.startswith("MCAST"):
         self.appRecQueue.put(msg)
         continue
 
-      if msg.kind == "MCAST":
-        # Handle multicast messages
-        if msg.seqid == self.latest_seqids_nodes[msg.src] + 1:
-          # R-Deliver the message
-          with self.hold_back_queue_lock:
-            self.co_hold_back_queue.append(msg)
-            self.new_messages_event.set()
-          self.latest_seqids_nodes[msg.src] += 1
-          # Deliver any outstanding messages on hold back queue
-          all_msgs_from_src = filter(lambda m: m.src == msg.src, self.hold_back_queue).sort(key=lambda m: m.seqid)
-          for hb_msg in all_msgs_from_src:
-            if hb_msg.seqid == self.latest_seqids_nodes[msg.src] + 1:
-              # R-Deliver the message
-              with self.hold_back_queue_lock:
-                self.co_hold_back_queue.append(msg)
-                self.new_messages_event.set()
-              self.latest_seqids_nodes[msg.src] += 1
-              self.hold_back_queue.remove(hb_msg)
-            else:
-              break
-        elif msg.seqid <= self.latest_seqids_nodes[msg.src]:
-          # Discard the message
-          pass
-        else:
-          # Append the message on hold back queue
-          self.hold_back_queue.append(msg)
-          # Send NACK to source node for missing messages
-          nack_origin_node = TimeStampedMessage(self.local_name, msg.src, "MCAST_NACK", self.latest_seqids_nodes[msg.src])
-          self.send(nack_origin_node)
+      logging.debug("MCAST Message received - Src: %s - Kind: %s - ID: %s" % (msg.src, msg.kind, msg.id))
 
-        for q,rq in msg.acks:
-          if rq > self.latest_seqids_nodes[q]:
-            # We have missed some messages from q
-            # Send NACK to q for them
-            nack_q_node = TimeStampedMessage(self.local_name, q, "MCAST_NACK", self.latest_seqids_nodes[q])
-            self.send(nack_q_node)
-      elif msg.kind == "MCAST_NACK":
+      # Process all special MCAST* messages first
+      if msg.kind == "MCAST_NACK":
         # Retransmit message from sent message cache
         rt_msg = copy(self.mcast_msgs_sent[msg.data])
         rt_msg.set_dest(msg.src)
         self.send(rt_msg)
-      else:
+        continue
+
+      # Handle ALL remaining multicast messages
+      if msg.seqid == self.latest_seqids_nodes[msg.src] + 1:
+        # R-Deliver the message
+        with self.hold_back_queue_lock:
+          self.co_hold_back_queue.append(msg)
+          self.new_messages_event.set()
+        self.latest_seqids_nodes[msg.src] += 1
+        # Deliver any outstanding messages on hold back queue
+        all_msgs_from_src = filter(lambda m: m.src == msg.src, self.hold_back_queue)
+        all_msgs_from_src.sort(key=lambda m: m.seqid)
+        for hb_msg in all_msgs_from_src:
+          if hb_msg.seqid == self.latest_seqids_nodes[msg.src] + 1:
+            # R-Deliver the message
+            with self.hold_back_queue_lock:
+              self.co_hold_back_queue.append(msg)
+              self.new_messages_event.set()
+            self.latest_seqids_nodes[msg.src] += 1
+            self.hold_back_queue.remove(hb_msg)
+          else:
+            break
+      elif msg.seqid <= self.latest_seqids_nodes[msg.src]:
+        # Discard the message
         pass
+      else:
+        # Append the message on hold back queue
+        logging.debug("Putting message on holdback queue - Src: %s - Kind: %s - ID: %s" % (msg.src, msg.kind, msg.id))
+        self.hold_back_queue.append(msg)
+        # Send NACK to source node for missing messages
+        nack_origin_node = TimeStampedMessage(self.local_name, msg.src, "MCAST_NACK", self.latest_seqids_nodes[msg.src])
+        self.send(nack_origin_node)
+
+      for q,rq in msg.acks:
+        if rq > self.latest_seqids_nodes[q]:
+          # We have missed some messages from q
+          # Send NACK to q for them
+          nack_q_node = TimeStampedMessage(self.local_name, q, "MCAST_NACK", self.latest_seqids_nodes[q])
+          self.send(nack_q_node)
 
   def co_deliver(self):
-    nodes_keys_sorted = self.mcast_group.sort()
     while True:
       # `new_clock_ticks` emulates a timer - but one which increments only when new 
       # messages are CO-Delivered - hence we need to run the thread again after
@@ -272,7 +279,7 @@ class MessagePasser(object):
         new_clock_ticks = False
         with self.hold_back_queue_lock:
           for msg in self.co_hold_back_queue:
-            j = nodes_keys_sorted.index(msg.src)
+            j = self.mcast_group.index(msg.src)
             if j == self.nid:
               self.appRecQueue.put(msg)
               self.co_hold_back_queue.remove(msg)
@@ -288,7 +295,7 @@ class MessagePasser(object):
           self.new_messages_event.clear()
 
   def receive(self):
-    if !self.appRecQueue.empty():
+    if not self.appRecQueue.empty():
       new_msg = self.appRecQueue.get()
       # Adjust time accordingly
       self.cs.adjust_clock(new_msg.timestamp)
