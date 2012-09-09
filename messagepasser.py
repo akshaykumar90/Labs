@@ -33,7 +33,7 @@ class MessagePasser(object):
   def update_config(self):
     # Zero out all the data structures
     self.nodes = {}
-    self.groups = {}
+    self.group_owners = {}
     self.sendRules = []
     self.receiveRules = []
 
@@ -45,19 +45,12 @@ class MessagePasser(object):
     # Read in new nodes mappings
     for config in dataMap['Configuration']:
       self.nodes[config['Name']] = (config['IP'], config['Port'])
-      self.groups[config['Name']] = config['Group']
-
-    self.mcast_group = self.groups[self.local_name]
-    self.mcast_group.sort()
+      self.group_owners[config['Name']] = config['Group']
 
     # Set a unique node id based on alphabetical ordering
     nodes_keys = self.nodes.keys()
     nodes_keys.sort()
     self.nid = nodes_keys.index(self.local_name)
-
-    # GroupID of the current process
-    # All processes in the same group have different group IDs
-    self.gid = self.mcast_group.index(self.local_name)
 
     # Read in new SendRules
     for sr in dataMap['SendRules']:
@@ -91,28 +84,46 @@ class MessagePasser(object):
     self.setup_mcast()
 
   def setup_mcast(self):
-    self.mcast_id = 0
-    self.latest_seqids_nodes = {}
-    for k in self.mcast_group:
-      self.latest_seqids_nodes[k] = 0
-    self.hold_back_queue = []
-    self.mcast_msgs_sent = {}
+    self.groups = {}
+    nodes_keys = self.nodes.keys()
+    nodes_keys.sort()
+    # Populate <code>groups</code> with metadata of groups which the 
+    # current process is part of.
+    # gid(key) : unique group ID of the group (globally unique)
+    # mid : member ID of the current process in the group (group-wise unique)
+    # members : group members (names) in sorted order
+    for owner, members in self.group_owners.iteritems():
+      members.sort()
+      if self.local_name in members:
+        gid = nodes_keys.index(owner)
+        mid = members.index(self.local_name)
+        self.groups[gid] = {
+          'members' : members,
+          'mid' : mid,
+        }
+
+    # More metadata
+    for gid,g in self.groups.iteritems():
+      g['mcast_id'] = 0
+      g['latest_seqids_nodes'] = {}
+      for k in g['members']:
+        g['latest_seqids_nodes'][k] = 0
+      g['hold_back_queue'] = []
+      g['mcast_msgs_sent'] = {}
+      # Initialize multicast clock service
+      cs_factory = ClockServiceFactory()
+      cs_factory.set_nodes(len(g['members'])) # No. of nodes in the group
+      cs_factory.set_host_node_id(g['mid']) # Member ID for *this* process
+      g['mcast_vector_clock'] = cs_factory.get_clock("VECTOR")
+
+    # Reference to group owned by this process
+    self.mcast_group = self.groups[self.nid]
 
     # Hold back queue required for causal ordering of message delivery
     self.co_hold_back_queue = []
-    # Initialize multicast clock service here
-    # Shoule be preceded by update_config()
-    cs_factory = ClockServiceFactory()
-    cs_factory.set_nodes(len(self.mcast_group)) # No. of nodes in the group
-    cs_factory.set_host_node_id(self.gid) # Group ID for *this* process
-    self.mcast_vector_clock = cs_factory.get_clock("VECTOR")
 
     # Event to notify of new messages on hold back queue for causal ordering
     self.new_messages_event = threading.Event()
-    # Lock to protect hold back queue during addition/removal of messages
-    # Messages are added when they are R-delivered
-    # They are removed when they are CO-delivered
-    self.hold_back_queue_lock = threading.Lock()
 
   def process_send_queue(self):
     while True:
@@ -152,17 +163,20 @@ class MessagePasser(object):
     pass
 
   def r_multicast(self, msg):
-    msg.set_src_seqid(self.mcast_id)
-    msg.set_acks(self.latest_seqids_nodes.items())
-    self.mcast_msgs_sent[self.mcast_id] = msg
-    self.mcast_id += 1
-    for dest in self.mcast_group:
+    mcast_group = self.mcast_group
+    mcast_id = mcast_group['mcast_id']
+    msg.set_src_seqid(mcast_id)
+    msg.set_acks(mcast_group['latest_seqids_nodes'].items())
+    mcast_group['mcast_msgs_sent'][mcast_id] = msg
+    mcast_id += 1
+    for dest in mcast_group['members']:
       msg_copy = copy(msg)
       msg_copy.set_dest(dest)
       self.send(msg_copy)
 
   def co_multicast(self, msg):
-    ts = self.mcast_vector_clock.clock_tick()
+    mcast_group = self.mcast_group
+    ts = mcast_group['mcast_vector_clock'].clock_tick()
     msg.set_timestamp(ts)
     self.r_multicast(msg)
 
@@ -221,78 +235,85 @@ class MessagePasser(object):
 
       logging.debug("MCAST Message received - Src: %s - Kind: %s - ID: %s" % (msg.src, msg.kind, msg.id))
 
+      # References for destination group of message received
+      msg_dest_group = self.groups[msg.gid]
+      mcast_msgs_sent = msg_dest_group['mcast_msgs_sent']
+      latest_seqids_nodes = msg_dest_group['latest_seqids_nodes']
+      hold_back_queue = msg_dest_group['hold_back_queue']
+
       # Process all special MCAST* messages first
       if msg.kind == "MCAST_NACK":
         # Retransmit message from sent message cache
-        rt_msg = copy(self.mcast_msgs_sent[msg.data])
+        rt_msg = copy(mcast_msgs_sent[msg.data])
         rt_msg.set_dest(msg.src)
         self.send(rt_msg)
         continue
 
       # Handle ALL remaining multicast messages
-      if msg.seqid == self.latest_seqids_nodes[msg.src] + 1:
-        # R-Deliver the message
-        with self.hold_back_queue_lock:
-          self.co_hold_back_queue.append(msg)
-          self.new_messages_event.set()
-        self.latest_seqids_nodes[msg.src] += 1
+      if msg.seqid == latest_seqids_nodes[msg.src] + 1:
+        self.__r_deliver_callback(msg)
+        latest_seqids_nodes[msg.src] += 1
         # Deliver any outstanding messages on hold back queue
-        all_msgs_from_src = filter(lambda m: m.src == msg.src, self.hold_back_queue)
+        all_msgs_from_src = filter(lambda m: m.src == msg.src, hold_back_queue)
         all_msgs_from_src.sort(key=lambda m: m.seqid)
         for hb_msg in all_msgs_from_src:
-          if hb_msg.seqid == self.latest_seqids_nodes[msg.src] + 1:
-            # R-Deliver the message
-            with self.hold_back_queue_lock:
-              self.co_hold_back_queue.append(msg)
-              self.new_messages_event.set()
-            self.latest_seqids_nodes[msg.src] += 1
-            self.hold_back_queue.remove(hb_msg)
+          if hb_msg.seqid == latest_seqids_nodes[msg.src] + 1:
+            self.__r_deliver_callback(msg)
+            latest_seqids_nodes[msg.src] += 1
+            hold_back_queue.remove(hb_msg)
           else:
             break
-      elif msg.seqid <= self.latest_seqids_nodes[msg.src]:
+      elif msg.seqid <= latest_seqids_nodes[msg.src]:
         # Discard the message
         pass
       else:
         # Append the message on hold back queue
         logging.debug("Putting message on holdback queue - Src: %s - Kind: %s - ID: %s" % (msg.src, msg.kind, msg.id))
-        self.hold_back_queue.append(msg)
+        hold_back_queue.append(msg)
         # Send NACK to source node for missing messages
-        nack_origin_node = TimeStampedMessage(self.local_name, msg.src, "MCAST_NACK", self.latest_seqids_nodes[msg.src])
+        nack_origin_node = TimeStampedMessage(self.local_name, msg.src, "MCAST_NACK", latest_seqids_nodes[msg.src])
         self.send(nack_origin_node)
 
       for q,rq in msg.acks:
-        if rq > self.latest_seqids_nodes[q]:
+        if rq > latest_seqids_nodes[q]:
           # We have missed some messages from q
           # Send NACK to q for them
-          nack_q_node = TimeStampedMessage(self.local_name, q, "MCAST_NACK", self.latest_seqids_nodes[q])
+          nack_q_node = TimeStampedMessage(self.local_name, q, "MCAST_NACK", latest_seqids_nodes[q])
           self.send(nack_q_node)
+
+  def __r_deliver_callback(self, msg):
+    # R-Deliver the message
+    self.co_hold_back_queue.append(msg)
+    self.new_messages_event.set()
 
   def co_deliver(self):
     while True:
-      # `new_clock_ticks` emulates a timer - but one which increments only when new 
-      # messages are CO-Delivered - hence we need to run the thread again after
-      # each new message is CO-Delivered. This is not a shared variable - local to
-      # this thread only
+      # <code>new_clock_ticks</code> emulates a timer - but one which increments 
+      # only when new  messages are CO-Delivered - hence we need to run the thread 
+      # again after each new message is CO-Delivered. This is not a shared variable 
+      # - local to this thread only
       new_clock_ticks = True
       self.new_messages_event.wait()
       while new_clock_ticks:
         new_clock_ticks = False
-        with self.hold_back_queue_lock:
-          for msg in self.co_hold_back_queue:
-            j = self.mcast_group.index(msg.src)
-            if j == self.nid:
-              self.appRecQueue.put(msg)
-              self.co_hold_back_queue.remove(msg)
-              self.mcast_vector_clock.clock_tick()
-              new_clock_ticks = True
-            elif self.mcast_vector_clock.co_next(msg.timestamp, j):
-              self.appRecQueue.put(msg)
-              self.co_hold_back_queue.remove(msg)
-              self.mcast_vector_clock.clock_tick_j(j)
-              new_clock_ticks = True
-            else:
-              pass
-          self.new_messages_event.clear()
+        for msg in self.co_hold_back_queue:
+          # References for destination group of message received
+          msg_dest_group = self.groups[msg.gid]
+          mcast_vector_clock = msg_dest_group['mcast_vector_clock']
+          j = msg_dest_group['members'].index(msg.src)
+          if j == msg_dest_group['mid']:
+            self.appRecQueue.put(msg)
+            self.co_hold_back_queue.remove(msg)
+            self.mcast_vector_clock.clock_tick()
+            new_clock_ticks = True
+          elif mcast_vector_clock.co_next(msg.timestamp, j):
+            self.appRecQueue.put(msg)
+            self.co_hold_back_queue.remove(msg)
+            mcast_vector_clock.clock_tick_j(j)
+            new_clock_ticks = True
+          else:
+            pass
+        self.new_messages_event.clear()
 
   def receive(self):
     if not self.appRecQueue.empty():

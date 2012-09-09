@@ -28,6 +28,10 @@ class RMessage(Message):
   def __init__(self, src, dest, kind, data):
     super(RMessage, self).__init__(src, dest, kind, data)
 
+  # Multicast group ID for the destination group
+  def set_mcast_gid(self, gid):
+    self.gid = gid
+
   # Multicast sequence ID for the source process
   def set_src_seqid(self, seqid):
     self.seqid = seqid
