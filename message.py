@@ -24,7 +24,7 @@ class TimeStampedMessage(Message):
     self.timestamp = ts
 
 class RMessage(Message):
-  """message suppoting reliable multicast delivery semantics"""
+  """message supporting reliable multicast delivery semantics"""
   def __init__(self, src, dest, kind, data):
     super(RMessage, self).__init__(src, dest, kind, data)
 
@@ -36,7 +36,7 @@ class RMessage(Message):
   def set_src_seqid(self, seqid):
     self.seqid = seqid
 
-  # Multicast acknowledgements of the form [<q,R(q)>]
+  # Multicast acknowledgments of the form [<q,R(q)>]
   def set_acks(self, acks):
     self.acks = acks
 

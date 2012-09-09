@@ -236,10 +236,10 @@ class MessagePasser(object):
       logging.debug("MCAST Message received - Src: %s - Kind: %s - ID: %s" % (msg.src, msg.kind, msg.id))
 
       # References for destination group of message received
-      msg_dest_group = self.groups[msg.gid]
-      mcast_msgs_sent = msg_dest_group['mcast_msgs_sent']
+      msg_dest_group      = self.groups[msg.gid]
+      mcast_msgs_sent     = msg_dest_group['mcast_msgs_sent']
       latest_seqids_nodes = msg_dest_group['latest_seqids_nodes']
-      hold_back_queue = msg_dest_group['hold_back_queue']
+      hold_back_queue     = msg_dest_group['hold_back_queue']
 
       # Process all special MCAST* messages first
       if msg.kind == "MCAST_NACK":
