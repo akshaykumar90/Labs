@@ -23,6 +23,9 @@ class TimeStampedMessage(Message):
   def set_timestamp(self, ts):
     self.timestamp = ts
 
+  def set_mcast_timestamp(self, mts):
+    self.mts = mts
+
 class RMessage(Message):
   """message supporting reliable multicast delivery semantics"""
   def __init__(self, src, dest, kind, data):

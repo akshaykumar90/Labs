@@ -2,10 +2,14 @@ import sys
 import threading
 from Queue import Queue
 import time
+import logging
 
 from messagepasser import MessagePasser
 from message import RCOMessage, TimeStampedMessage
 from clockservice import ClockServiceFactory
+
+logging.basicConfig(filename="messagepasserlog.txt", \
+  level=logging.DEBUG, format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
 
 # Globals
 K = 3 # ACKs required to continue (= processes in the group)
@@ -16,32 +20,45 @@ requests_queue = Queue()
 acks_received = 0
 
 def process_received_messages(mp):
+  global lock_acquired
+  global lock_acquired_event
+  global voted
+  global requests_queue
+  global acks_received
   while True:
     msg = mp.receive()
     while msg is not None:
       if msg.kind == "MCAST_CS_REQUEST":
+        logging.debug("MCAST_CS_REQUEST received from %s" % (msg.src,))
         # On receipt of a request
         if lock_acquired or voted:
+          logging.debug("queuing request without replying...")
           # queue request without replying
           requests_queue.put(msg)
         else:
+          logging.debug("sending ack...")
           # send reply
-          cs_ack = TimeStampedMessage(self.local_name, msg.src, "CS_ACK", self.local_name)
+          cs_ack = TimeStampedMessage(mp.local_name, msg.src, "CS_ACK", mp.local_name)
           mp.send(cs_ack)
           voted = True
       elif msg.kind == "MCAST_CS_RELEASE":
+        logging.debug("MCAST_CS_RELEASE received from %s" % (msg.src,))
         # On receipt of a release
         if not requests_queue.empty():
+          logging.debug("removing head of queue and sending ack")
           # remove head of queue and send reply
           head = requests_queue.get()
-          cs_ack = TimeStampedMessage(self.local_name, head.src, "CS_ACK", self.local_name)
+          cs_ack = TimeStampedMessage(mp.local_name, head.src, "CS_ACK", mp.local_name)
           mp.send(cs_ack)
           voted = True
         else:
           voted = False
       elif msg.kind == "CS_ACK":
+        logging.debug("CS_ACK received from %s" % (msg.src,))
         acks_received += 1
+        logging.debug("acks received so far = %d" % (acks_received,))
         if acks_received == K:
+          logging.debug("%d acks received." % (K,))
           lock_acquired = True
           lock_acquired_event.set()
       else:
@@ -58,7 +75,7 @@ if __name__ == '__main__':
     mp.update_config()
 
     # Update K
-    K = len(mp.mcast_group)
+    K = len(mp.mcast_group['members'])
 
     # Initialize the clock service here
     # Should be done AFTER update_config() on MessagePasser

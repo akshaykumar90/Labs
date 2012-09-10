@@ -11,7 +11,7 @@ from message import Message, TimeStampedMessage, RMessage, RCOMessage
 from clockservice import ClockServiceFactory
 
 logging.basicConfig(filename="messagepasserlog.txt", \
-  level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+  level=logging.DEBUG, format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
 
 class MessagePasser(object):
   """sends and receives Messages"""
@@ -104,7 +104,7 @@ class MessagePasser(object):
 
     # More metadata
     for gid,g in self.groups.iteritems():
-      g['mcast_id'] = 0
+      g['mcast_id'] = 1
       g['latest_seqids_nodes'] = {}
       for k in g['members']:
         g['latest_seqids_nodes'][k] = 0
@@ -165,10 +165,11 @@ class MessagePasser(object):
   def r_multicast(self, msg):
     mcast_group = self.mcast_group
     mcast_id = mcast_group['mcast_id']
+    msg.set_mcast_gid(self.nid)
     msg.set_src_seqid(mcast_id)
     msg.set_acks(mcast_group['latest_seqids_nodes'].items())
     mcast_group['mcast_msgs_sent'][mcast_id] = msg
-    mcast_id += 1
+    mcast_group['mcast_id'] += 1
     for dest in mcast_group['members']:
       msg_copy = copy(msg)
       msg_copy.set_dest(dest)
@@ -177,7 +178,7 @@ class MessagePasser(object):
   def co_multicast(self, msg):
     mcast_group = self.mcast_group
     ts = mcast_group['mcast_vector_clock'].clock_tick()
-    msg.set_timestamp(ts)
+    msg.set_mcast_timestamp(ts)
     self.r_multicast(msg)
 
   def __match_message(self, msg):
@@ -230,6 +231,7 @@ class MessagePasser(object):
 
       # Process only MCAST/MCAST_NACK messages
       if not msg.kind.startswith("MCAST"):
+        logging.debug("Putting msg on appRecQueue...")
         self.appRecQueue.put(msg)
         continue
 
@@ -249,8 +251,10 @@ class MessagePasser(object):
         self.send(rt_msg)
         continue
 
+      logging.debug("msg.seqid = %d - latest_seqids_nodes[msg.src] = %d" % (msg.seqid, latest_seqids_nodes[msg.src]))
       # Handle ALL remaining multicast messages
       if msg.seqid == latest_seqids_nodes[msg.src] + 1:
+        logging.debug("In-order mcast message received")
         self.__r_deliver_callback(msg)
         latest_seqids_nodes[msg.src] += 1
         # Deliver any outstanding messages on hold back queue
@@ -264,6 +268,7 @@ class MessagePasser(object):
           else:
             break
       elif msg.seqid <= latest_seqids_nodes[msg.src]:
+        logging.debug("mcast message received too late")
         # Discard the message
         pass
       else:
@@ -282,6 +287,7 @@ class MessagePasser(object):
           self.send(nack_q_node)
 
   def __r_deliver_callback(self, msg):
+    logging.debug("R-Deliver the message - Src: %s - Kind: %s - ID: %s" % (msg.src, msg.kind, msg.id))
     # R-Deliver the message
     self.co_hold_back_queue.append(msg)
     self.new_messages_event.set()
@@ -293,7 +299,9 @@ class MessagePasser(object):
       # again after each new message is CO-Delivered. This is not a shared variable 
       # - local to this thread only
       new_clock_ticks = True
+      logging.debug("Waiting for new messages...")
       self.new_messages_event.wait()
+      logging.debug("New messages event set...")
       while new_clock_ticks:
         new_clock_ticks = False
         for msg in self.co_hold_back_queue:
@@ -301,12 +309,16 @@ class MessagePasser(object):
           msg_dest_group = self.groups[msg.gid]
           mcast_vector_clock = msg_dest_group['mcast_vector_clock']
           j = msg_dest_group['members'].index(msg.src)
+          logging.debug("msg.gid = %d - j = %d - msg_dest_group['mid'] = %d" % (msg.gid,j,msg_dest_group['mid']))
+          logging.debug("msg.timestamp = %s - mcast_vector_clock.timestamp = %s" % (msg.mts, mcast_vector_clock.timestamp))
           if j == msg_dest_group['mid']:
+            logging.debug("Putting msg on appRecQueue...")
             self.appRecQueue.put(msg)
             self.co_hold_back_queue.remove(msg)
-            self.mcast_vector_clock.clock_tick()
+            # mcast_vector_clock.clock_tick()
             new_clock_ticks = True
-          elif mcast_vector_clock.co_next(msg.timestamp, j):
+          elif mcast_vector_clock.co_next(msg.mts, j):
+            logging.debug("Putting msg on appRecQueue...")
             self.appRecQueue.put(msg)
             self.co_hold_back_queue.remove(msg)
             mcast_vector_clock.clock_tick_j(j)

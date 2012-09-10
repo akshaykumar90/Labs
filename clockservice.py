@@ -42,7 +42,7 @@ class VectorClock(object):
     return self.timestamp
 
   def clock_tick_j(self, j):
-    self.timestamp[j-1] += 1
+    self.timestamp[j] += 1
     return self.timestamp
 
   def adjust_clock(self, tm):
@@ -51,13 +51,13 @@ class VectorClock(object):
     return self.timestamp
 
   def __lessthanequalto(self, tl, tr):
-    result = true
+    result = True
     for i,t in enumerate(tr):
       result = result and (tl[i] <= t)
     return result
 
   def __notequalto(self, tl, tr):
-    result = false
+    result = False
     for i,t in enumerate(tr):
       result = result or (tl[i] != t)
     return result
@@ -79,9 +79,9 @@ class VectorClock(object):
        This holds true only when vj[j] = vi[j] + 1 and vj[k] <= vi[k] (k /= j)
     """
     if vj[j] != self.timestamp[j] + 1:
-      return false
+      return False
 
-    result = true
+    result = True
     for k,t in enumerate(self.timestamp):
       if k != j: result = result and (vj[k] <= t)
     return result
